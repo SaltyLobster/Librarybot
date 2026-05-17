@@ -1,0 +1,12 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment files
+.env
+
+# Telegram bot token
+*.token
+
+*/Bookcovers/*
