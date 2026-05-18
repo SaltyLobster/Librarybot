@@ -6,12 +6,14 @@ import logging
 import os
 import unicodedata
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
@@ -20,10 +22,13 @@ from telegram.ext import (
     filters,
 )
 
+# ============================================================================
+# Configuration and Constants
+# ============================================================================
+
 CSV_PATH = Path(__file__).parent / "kindle_books.csv"
 ENV_PATH = Path(__file__).parent / ".env"
 PAGE_SIZE = 8
-CALLBACK_DATA_STORE: Dict[str, Dict[str, str]] = {}
 SUPPORTED_COVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 COVER_FILE_CATALOG: Optional[List[Path]] = None
 COVER_CANDIDATE_INDEX: Optional[List[Tuple[Path, str, Set[str]]]] = None
@@ -35,6 +40,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Enums and Constants
+# ============================================================================
+
+class CallbackType(str, Enum):
+    """Callback types for button actions."""
+    SEARCH = "search"
+    GENRE = "genre"
+    DETAIL = "detail"
+    COVERS = "covers"
+    MENU = "menu"
+
+
+class UserAction(str, Enum):
+    """User text actions for main menu."""
+    SEARCH = "search by name or author"
+    GENRES = "genres"
+    HELP = "help"
+
+
+class MessageKey(str, Enum):
+    """Keys for storing user data."""
+    AWAITING_SEARCH = "awaiting_search"
+
+
+# ============================================================================
+# Data Models
+# ============================================================================
+
 @dataclass
 class Book:
     title: str
@@ -44,6 +78,10 @@ class Book:
     cover_path: Optional[str] = None
     id: Optional[str] = None
 
+
+# ============================================================================
+# Utility Functions - File I/O and Cover Discovery
+# ============================================================================
 
 def parse_tags(raw_value: str) -> List[str]:
     value = raw_value.strip()
@@ -103,7 +141,7 @@ def normalize_name(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value)
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     normalized = normalized.lower()
-    for char in "-_./\\'\"()[]{}:;,&!?$@#%^*+=~`|<>" + "“”‘’”–—“”":
+    for char in "-_./\\'\"()[]{}:;,&!?$@#%^*+=~`|<>" + """''"–—""":
         normalized = normalized.replace(char, " ")
     normalized = " ".join(normalized.split())
     return normalized
@@ -180,9 +218,8 @@ def find_cover_for_book(book: Book) -> Optional[str]:
     return None
 
 
-def load_books(csv_path: Path) -> Tuple[List[Book], List[str]]:
+def load_books(csv_path: Path) -> List[Book]:
     books: List[Book] = []
-    genres: set[str] = set()
 
     with csv_path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -207,9 +244,8 @@ def load_books(csv_path: Path) -> Tuple[List[Book], List[str]]:
             if not book.cover_path:
                 book.cover_path = find_cover_for_book(book)
             books.append(book)
-            genres.update(tags)
 
-    return books, sorted(genres, key=lambda item: item.lower())
+    return books
 
 
 def load_dotenv(dotenv_path: Path) -> None:
@@ -230,353 +266,341 @@ def load_dotenv(dotenv_path: Path) -> None:
                 os.environ[key] = value
 
 
+# ============================================================================
+# Callback Data Handler - Manages callback serialization/deserialization
+# ============================================================================
 
-def build_callback_id(kind: str, value: str) -> str:
-    identifier = hashlib.sha256(f"{kind}:{value}".encode("utf-8")).hexdigest()[:10]
-    CALLBACK_DATA_STORE[identifier] = {"kind": kind, "value": value}
-    return identifier
-
-
-def get_callback_payload(callback_id: str) -> Optional[Dict[str, str]]:
-    return CALLBACK_DATA_STORE.get(callback_id)
-
-
-def build_main_menu() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton("Search by Name or Author"), KeyboardButton("Genres")],
-        [KeyboardButton("Help")],
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
-
-
-def format_book_item(book: Book, index: Optional[int] = None) -> str:
-    safe_title = html.escape(book.title)
-    safe_author = html.escape(book.authors)
-    safe_tags = html.escape(", ".join(book.tags)) if book.tags else "None"
-    safe_desc = html.escape(book.description) if book.description else None
-    cover_note = "\n📷 Cover available" if book.cover_path else ""
-    title_text = f"<b>{index}. {safe_title}</b>" if index is not None else f"<b>{safe_title}</b>"
-    lines = [f"{title_text} — {safe_author}", f"Genres: {safe_tags}"]
-    if safe_desc:
-        lines.append(safe_desc)
-    if cover_note:
-        lines.append(cover_note)
-    return "\n".join(lines)
-
-
-def render_books_page(
-    books: List[Book],
-    page: int,
-    filter_kind: str,
-    callback_id: str,
-    label: str,
-) -> Tuple[str, InlineKeyboardMarkup]:
-    total = len(books)
-    if total == 0:
-        message = f"No books found for {label}. Try another search or select a different genre."
-        return message, InlineKeyboardMarkup([[InlineKeyboardButton("Menu", callback_data="menu")]])
-
-    page_count = (total + PAGE_SIZE - 1) // PAGE_SIZE
-    page = max(0, min(page, page_count - 1))
-    start = page * PAGE_SIZE
-    page_books = books[start : start + PAGE_SIZE]
-
-    lines = [f"<b>{total}</b> books found for {label}. Showing page {page + 1} of {page_count}.\n"]
-    has_any_covers = any(book.cover_path for book in page_books)
-    if has_any_covers:
-        lines.append("Cover images are shown below as part of each book’s caption.")
-
-    for index, book in enumerate(page_books, start=1):
-        lines.append(format_book_item(book, index=index))
-
-    message = "\n\n".join(lines)
-
-    buttons = []
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(
-            InlineKeyboardButton(
-                "Previous", callback_data=f"{filter_kind}|{callback_id}|{page - 1}"
-            )
-        )
-    if page < page_count - 1:
-        nav_buttons.append(
-            InlineKeyboardButton("Next", callback_data=f"{filter_kind}|{callback_id}|{page + 1}")
-        )
-    if nav_buttons:
-        buttons.append(nav_buttons)
-
-    detail_rows: List[InlineKeyboardButton] = []
-    row: List[InlineKeyboardButton] = []
-    for item_index, book in enumerate(page_books):
-        if book.cover_path:
-            row.append(
-                InlineKeyboardButton(
-                    str(item_index + 1),
-                    callback_data=f"detail|{callback_id}|{page}|{item_index}",
-                )
-            )
-            if len(row) >= 4:
-                detail_rows.append(row)
-                row = []
-    if row:
-        detail_rows.append(row)
-    if detail_rows:
-        buttons.extend(detail_rows)
-
-    buttons.append([InlineKeyboardButton("Menu", callback_data="menu")])
-    return message, InlineKeyboardMarkup(buttons)
-
-
-async def send_book_cover_messages(
-    message,
-    page_books: List[Book],
-    page_start: int = 0,
-    fallback_text: Optional[str] = None,
-    final_markup: Optional[InlineKeyboardMarkup] = None,
-    final_message: Optional[str] = None,
-) -> None:
-    """Send one photo message per book in `page_books`.
-
-    After sending all photos, send a small navigation message with
-    `final_markup` (if provided) so the user can navigate pages. The
-    optional `final_message` is used as the text shown above the
-    navigation buttons (e.g. "Page X of Y").
-    """
-    sent_any = False
-    for offset, book in enumerate(page_books):
-        if not book.cover_path:
-            continue
-
-        sent_any = True
-        safe_title = html.escape(book.title)
-        safe_author = html.escape(book.authors)
-        safe_tags = html.escape(", ".join(book.tags)) if book.tags else "None"
-        safe_desc = html.escape(book.description) if book.description else "No description available."
-        caption = (
-            f"<b>{page_start + offset + 1}. {safe_title}</b> — {safe_author}\n"
-            f"Genres: {safe_tags}\n\n"
-            f"{safe_desc}"
-        )
-
-        try:
-            await message.reply_photo(
-                photo=book.cover_path,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            logger.exception("Failed to send cover image for %s", book.title)
-
-    # If we didn't send any covers, send the fallback text (if provided).
-    if not sent_any:
-        if fallback_text:
-            await message.reply_text(fallback_text)
-        return
-
-    # After sending all photos, send a short navigation message with markup
-    # so the user can go to the next/previous page.
-    if final_markup:
-        try:
-            await message.reply_text(final_message or "", reply_markup=final_markup)
-        except Exception:
-            # Fallback to a small text if empty message is rejected
+class CallbackDataHandler:
+    """Handles serialization and deserialization of callback data."""
+    
+    def __init__(self):
+        self._store: Dict[str, Dict[str, str]] = {}
+    
+    def encode(self, kind: str, value: str) -> str:
+        """Encode callback data and return a short identifier."""
+        identifier = hashlib.sha256(f"{kind}:{value}".encode("utf-8")).hexdigest()[:10]
+        self._store[identifier] = {"kind": kind, "value": value}
+        return identifier
+    
+    def decode(self, callback_id: str) -> Optional[Dict[str, str]]:
+        """Decode callback ID back to original kind and value."""
+        return self._store.get(callback_id)
+    
+    def build_callback_data(self, kind: str, callback_id: str, page: int, item_index: Optional[int] = None) -> str:
+        """Build complete callback data string for button."""
+        if item_index is not None:
+            return f"{kind}|{callback_id}|{page}|{item_index}"
+        return f"{kind}|{callback_id}|{page}"
+    
+    def parse_callback_data(self, data: str) -> Optional[Dict[str, Any]]:
+        """Parse callback data string into components."""
+        segments = data.split("|")
+        if len(segments) not in (3, 4):
+            return None
+        
+        kind, callback_id, page_token = segments[0], segments[1], segments[2]
+        item_index: Optional[int] = None
+        
+        if len(segments) == 4:
             try:
-                await message.reply_text(final_message or "Current page", reply_markup=final_markup)
-            except Exception:
-                logger.exception("Failed to send navigation markup")
-
-
-def find_books_by_query(query: str) -> List[Book]:
-    needle = query.lower()
-    return [
-        book
-        for book in BOOKS
-        if needle in book.title.lower() or needle in book.authors.lower()
-    ]
-
-
-def find_books_by_genre(genre: str) -> List[Book]:
-    needle = genre.lower()
-    return [book for book in BOOKS if any(tag.lower() == needle for tag in book.tags)]
-
-
-def get_results_from_payload(payload: Dict[str, str]) -> List[Book]:
-    kind = payload.get("kind")
-    value = payload.get("value", "")
-    if kind == "search":
-        return find_books_by_query(value)
-    if kind == "genre":
-        return find_books_by_genre(value)
-    return []
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Welcome to your library bot!\n\n"
-        "Use the buttons below to search by title or author, or choose a genre.",
-        reply_markup=build_main_menu(),
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Use the buttons below or type one of the options:\n"
-        "• Search by Name or Author\n"
-        "• Genres\n"
-        "• Help\n\n"
-        "If you choose Search, type any part of a title or author name.\n"
-        "If you choose Genres, tap a genre button to browse books in that tag.",
-        reply_markup=build_main_menu(),
-    )
-
-
-async def ask_for_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["awaiting_search"] = True
-    await update.message.reply_text(
-        "Enter a book title or author name to search for.",
-        reply_markup=build_main_menu(),
-    )
-
-
-async def send_genre_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    buttons = []
-    row: List[InlineKeyboardButton] = []
-    for genre in GENRES:
-        callback_id = build_callback_id("genre", genre)
-        row.append(
-            InlineKeyboardButton(genre, callback_data=f"genre|{callback_id}|0")
-        )
-        if len(row) >= 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    buttons.append([InlineKeyboardButton("Menu", callback_data="menu")])
-    await update.message.reply_text(
-        "Choose a genre:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()
-
-    if context.user_data.get("awaiting_search"):
-        context.user_data["awaiting_search"] = False
-        query = text
-        if not query:
-            await update.message.reply_text(
-                "Please send a non-empty search query.", reply_markup=build_main_menu()
-            )
-            return
-
-        results = find_books_by_query(query)
-        callback_id = build_callback_id("search", query.lower())
-        message, markup = render_books_page(
-            results, 0, filter_kind="search", callback_id=callback_id, label=f"search \"{html.escape(query)}\"",
-        )
-        # Send per-book photo messages followed by navigation buttons.
-        page_books = results[:PAGE_SIZE]
-        page_count = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
-        final_message = f"Page 1 of {page_count}"
-        await send_book_cover_messages(
-            update.message,
-            page_books,
-            page_start=0,
-            fallback_text="I could not send cover images for this search page.",
-            final_markup=markup,
-            final_message=final_message,
-        )
-        return
-
-    lowered = text.lower()
-    if lowered == "search by name or author":
-        await ask_for_search(update, context)
-        return
-    if lowered == "genres":
-        await send_genre_menu(update, context)
-        return
-    if lowered == "help":
-        await help_command(update, context)
-        return
-
-    await update.message.reply_text(
-        "Please use the menu buttons below or type Help for instructions.",
-        reply_markup=build_main_menu(),
-    )
-
-
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if query is None or query.data is None:
-        return
-    data = query.data
-
-    if data == "menu":
-        await query.answer()
-        await query.message.reply_text(
-            "Back to the main menu.",
-            reply_markup=build_main_menu(),
-        )
-        return
-
-    segments = data.split("|")
-    if len(segments) not in (3, 4):
-        await query.answer("Unknown command", show_alert=True)
-        return
-
-    kind, callback_id, page_token = segments[0], segments[1], segments[2]
-    item_index: Optional[int] = None
-    if len(segments) == 4:
+                item_index = int(segments[3])
+            except ValueError:
+                return None
+        
         try:
-            item_index = int(segments[3])
+            page = int(page_token)
         except ValueError:
-            item_index = None
+            return None
+        
+        payload = self.decode(callback_id)
+        if payload is None or payload.get("kind") != kind:
+            return None
+        
+        return {
+            "kind": kind,
+            "callback_id": callback_id,
+            "page": page,
+            "item_index": item_index,
+            "value": payload.get("value", ""),
+        }
 
-    payload = get_callback_payload(callback_id)
-    if payload is None or payload.get("kind") != kind:
-        await query.answer("This selection is no longer available.", show_alert=True)
-        return
 
-    page = 0
-    try:
-        page = int(page_token)
-    except ValueError:
-        page = 0
+# ============================================================================
+# Message Formatter - Centralized formatting logic (DRY principle)
+# ============================================================================
 
-    if kind == "detail":
-        if item_index is None:
-            await query.answer("Book selection is invalid.", show_alert=True)
-            return
-
-        results = get_results_from_payload(payload)
-        item_offset = page * PAGE_SIZE + item_index
-        if item_offset < 0 or item_offset >= len(results):
-            await query.answer("This book is no longer available.", show_alert=True)
-            return
-
-        book = results[item_offset]
-        safe_title = html.escape(book.title)
-        safe_author = html.escape(book.authors)
-        safe_tags = html.escape(", ".join(book.tags)) if book.tags else "None"
-        safe_desc = html.escape(book.description) if book.description else "No description available."
-        caption = (
+class MessageFormatter:
+    """Formats messages and captions for the bot."""
+    
+    @staticmethod
+    def escape_html(text: Optional[str]) -> str:
+        """Safely escape HTML in text."""
+        return html.escape(text) if text else ""
+    
+    @staticmethod
+    def format_book_item(book: Book, index: Optional[int] = None) -> str:
+        """Format a book entry with title, author, genres, and description."""
+        safe_title = MessageFormatter.escape_html(book.title)
+        safe_author = MessageFormatter.escape_html(book.authors)
+        safe_tags = MessageFormatter.escape_html(", ".join(book.tags)) if book.tags else "None"
+        safe_desc = MessageFormatter.escape_html(book.description)
+        
+        cover_note = "\n📷 Cover available" if book.cover_path else ""
+        title_text = f"<b>{index}. {safe_title}</b>" if index is not None else f"<b>{safe_title}</b>"
+        
+        lines = [f"{title_text} — {safe_author}", f"Genres: {safe_tags}"]
+        if safe_desc:
+            lines.append(safe_desc)
+        if cover_note:
+            lines.append(cover_note)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def format_book_caption(book: Book) -> str:
+        """Format a book caption for photo/detail messages."""
+        safe_title = MessageFormatter.escape_html(book.title)
+        safe_author = MessageFormatter.escape_html(book.authors)
+        safe_tags = MessageFormatter.escape_html(", ".join(book.tags)) if book.tags else "None"
+        safe_desc = MessageFormatter.escape_html(book.description) or "No description available."
+        
+        return (
             f"<b>{safe_title}</b> — {safe_author}\n"
             f"Genres: {safe_tags}\n\n"
             f"{safe_desc}"
         )
-        await query.answer()
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    "Back to results",
-                    callback_data=f"{payload['kind']}|{callback_id}|{page}",
-                )
-            ],
-            [InlineKeyboardButton("Menu", callback_data="menu")],
+    
+    @staticmethod
+    def format_book_caption_with_index(book: Book, index: int) -> str:
+        """Format a book caption with index for paginated results."""
+        safe_title = MessageFormatter.escape_html(book.title)
+        safe_author = MessageFormatter.escape_html(book.authors)
+        safe_tags = MessageFormatter.escape_html(", ".join(book.tags)) if book.tags else "None"
+        safe_desc = MessageFormatter.escape_html(book.description) or "No description available."
+        
+        return (
+            f"<b>{index}. {safe_title}</b> — {safe_author}\n"
+            f"Genres: {safe_tags}\n\n"
+            f"{safe_desc}"
+        )
+
+
+# ============================================================================
+# Book Service - Handles all search and filter operations
+# ============================================================================
+
+class BookService:
+    """Service class for book search and filtering operations."""
+    
+    def __init__(self, books: List[Book]):
+        self.books = books
+        self.genres = sorted(set(tag for book in books for tag in book.tags), key=lambda x: x.lower())
+    
+    def find_by_query(self, query: str) -> List[Book]:
+        """Find books by title or author."""
+        needle = query.lower()
+        return [
+            book for book in self.books
+            if needle in book.title.lower() or needle in book.authors.lower()
         ]
+    
+    def find_by_genre(self, genre: str) -> List[Book]:
+        """Find books by genre tag."""
+        needle = genre.lower()
+        return [book for book in self.books if any(tag.lower() == needle for tag in book.tags)]
+    
+    def get_results(self, kind: str, value: str) -> List[Book]:
+        """Get results based on callback kind and value."""
+        if kind == CallbackType.SEARCH.value:
+            return self.find_by_query(value)
+        elif kind == CallbackType.GENRE.value:
+            return self.find_by_genre(value)
+        return []
+
+
+# ============================================================================
+# UI Builder - Handles button and keyboard generation
+# ============================================================================
+
+class UIBuilder:
+    """Builds UI elements (buttons, keyboards) for messages."""
+    
+    @staticmethod
+    def build_main_menu() -> ReplyKeyboardMarkup:
+        """Build the main menu keyboard."""
+        buttons = [
+            [KeyboardButton(UserAction.SEARCH.value), KeyboardButton(UserAction.GENRES.value)],
+            [KeyboardButton(UserAction.HELP.value)],
+        ]
+        return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+    
+    @staticmethod
+    def build_genre_buttons(genres: List[str], callback_handler: CallbackDataHandler) -> InlineKeyboardMarkup:
+        """Build genre selection buttons."""
+        buttons = []
+        row: List[InlineKeyboardButton] = []
+        
+        for genre in genres:
+            callback_id = callback_handler.encode(CallbackType.GENRE.value, genre)
+            callback_data = callback_handler.build_callback_data(CallbackType.GENRE.value, callback_id, 0)
+            row.append(InlineKeyboardButton(genre, callback_data=callback_data))
+            
+            if len(row) >= 2:
+                buttons.append(row)
+                row = []
+        
+        if row:
+            buttons.append(row)
+        
+        buttons.append([InlineKeyboardButton("Menu", callback_data=CallbackType.MENU.value)])
+        return InlineKeyboardMarkup(buttons)
+
+    @staticmethod
+    def build_pagination_buttons(
+        kind: str,
+        callback_id: str,
+        page: int,
+        page_count: int,
+        callback_handler: CallbackDataHandler,
+    ) -> List[List[InlineKeyboardButton]]:
+        """Build pagination buttons: Previous/Next row + page number row."""
+        if page_count <= 1:
+            return []
+    
+        def make_btn(p: int) -> InlineKeyboardButton:
+            data = callback_handler.build_callback_data(kind, callback_id, p)
+            return InlineKeyboardButton(f" {p + 1} ", callback_data=data)
+    
+        rows: List[List[InlineKeyboardButton]] = []
+    
+        # Row 1: Previous / Next
+        nav_row = []
+        if page > 0:
+            prev_data = callback_handler.build_callback_data(kind, callback_id, page - 1)
+            nav_row.append(InlineKeyboardButton("Previous", callback_data=prev_data))
+        if page < page_count - 1:
+            next_data = callback_handler.build_callback_data(kind, callback_id, page + 1)
+            nav_row.append(InlineKeyboardButton("Next", callback_data=next_data))
+        if nav_row:
+            rows.append(nav_row)
+    
+        # Row 2: page index buttons
+        # Always include page 1 and last page.
+        # Between them: up to 3 neighbors on each side of current page, excluding current.
+        neighbors = [
+            p for p in range(page - 3, page + 4)
+            if 0 < p < page_count - 1 and p != page
+        ]
+        pages_to_show = sorted(set([0] + neighbors + [page_count - 1]))
+    
+        rows.append([make_btn(p) for p in pages_to_show])
+    
+        return rows
+    
+    @staticmethod
+    def build_back_to_results_buttons(
+        kind: str,
+        callback_id: str,
+        page: int,
+    ) -> List[List[InlineKeyboardButton]]:
+        """Build back to results and menu buttons."""
+        return [
+            [InlineKeyboardButton("Back to results", callback_data=f"{kind}|{callback_id}|{page}")],
+            [InlineKeyboardButton("Menu", callback_data=CallbackType.MENU.value)],
+        ]
+
+
+# ============================================================================
+# Response Builders - Handles response message and markup generation
+# ============================================================================
+
+class PagedResponseBuilder:
+    """Builds paginated response messages."""
+    
+    def __init__(self, service: BookService, callback_handler: CallbackDataHandler):
+        self.service = service
+        self.callback_handler = callback_handler
+    
+    def build_results_page(
+        self,
+        books: List[Book],
+        page: int,
+        kind: str,
+        callback_id: str,
+        label: str,
+    ) -> Tuple[str, InlineKeyboardMarkup]:
+        """Build a paginated results page."""
+        total = len(books)
+        if total == 0:
+            message = f"No books found for {label}. Try another search or select a different genre."
+            return message, InlineKeyboardMarkup([[InlineKeyboardButton("Menu", callback_data=CallbackType.MENU.value)]])
+        
+        page_count = (total + PAGE_SIZE - 1) // PAGE_SIZE
+        page = max(0, min(page, page_count - 1))
+        start = page * PAGE_SIZE
+        page_books = books[start : start + PAGE_SIZE]
+        
+        # Build message text
+        lines = [f"<b>{total}</b> books found for {label}. Showing page {page + 1} of {page_count}.\n"]
+        has_any_covers = any(book.cover_path for book in page_books)
+        if has_any_covers:
+            lines.append("Cover images are shown below as part of each book's caption.")
+        
+        for index, book in enumerate(page_books, start=1):
+            lines.append(MessageFormatter.format_book_item(book, index=index))
+        
+        message = "\n\n".join(lines)
+        
+        # Build markup with buttons
+        buttons: List[List[InlineKeyboardButton]] = []
+        
+        # Add pagination buttons
+        pagination_rows = UIBuilder.build_pagination_buttons(
+            kind, callback_id, page, page_count, self.callback_handler
+        )
+        buttons.extend(pagination_rows)
+        
+        # Add menu button
+        buttons.append([InlineKeyboardButton("Menu", callback_data=CallbackType.MENU.value)])
+        
+        return message, InlineKeyboardMarkup(buttons)
+
+
+# ============================================================================
+# Callback Handlers - Handle specific callback types
+# ============================================================================
+
+class CallbackHandlerFactory:
+    """Factory for creating callback handlers based on type."""
+    
+    def __init__(self, service: BookService, callback_handler: CallbackDataHandler):
+        self.service = service
+        self.callback_handler = callback_handler
+        self.response_builder = PagedResponseBuilder(service, callback_handler)
+    
+    async def handle_detail(self, query: Any, data: Dict[str, Any]) -> None:
+        """Handle detail view callback."""
+        item_index = data["item_index"]
+        page = data["page"]
+        callback_id = data["callback_id"]
+        kind = data["kind"]
+        
+        if item_index is None:
+            await query.answer("Book selection is invalid.", show_alert=True)
+            return
+        
+        results = self.service.get_results(kind, data["value"])
+        item_offset = page * PAGE_SIZE + item_index
+        if item_offset < 0 or item_offset >= len(results):
+            await query.answer("This book is no longer available.", show_alert=True)
+            return
+        
+        book = results[item_offset]
+        caption = MessageFormatter.format_book_caption(book)
+        await query.answer()
+        
+        buttons = UIBuilder.build_back_to_results_buttons(kind, callback_id, page)
+        
         if book.cover_path:
             try:
                 await query.message.reply_photo(
@@ -597,136 +621,295 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode=ParseMode.HTML,
             )
-        return
-
-    if kind == "covers":
-        results = get_results_from_payload(payload)
-        page_count = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
-        page = max(0, min(page, page_count - 1))
+    
+    async def handle_search(self, query: Any, data: Dict[str, Any]) -> None:
+        """Handle search results callback."""
+        value = data["value"]
+        page = data["page"]
+        callback_id = data["callback_id"]
+        
+        results = self.service.find_by_query(value)
+        label = f"search \"{MessageFormatter.escape_html(value)}\""
+        message, markup = self.response_builder.build_results_page(
+            results, page, CallbackType.SEARCH.value, callback_id, label
+        )
+        
+        await query.answer()
         start = page * PAGE_SIZE
         page_books = results[start : start + PAGE_SIZE]
-        medias = []
-        for book in page_books:
+        page_count = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
+        
+        await self._send_book_cover_messages(
+            query.message,
+            page_books,
+            page_start=start,
+            final_message=f"Page {page + 1} of {page_count}",
+            final_markup=markup,
+        )
+    
+    async def handle_genre(self, query: Any, data: Dict[str, Any]) -> None:
+        """Handle genre results callback."""
+        value = data["value"]
+        page = data["page"]
+        callback_id = data["callback_id"]
+        
+        results = self.service.find_by_genre(value)
+        label = f"genre \"{MessageFormatter.escape_html(value)}\""
+        message, markup = self.response_builder.build_results_page(
+            results, page, CallbackType.GENRE.value, callback_id, label
+        )
+        
+        await query.answer()
+        start = page * PAGE_SIZE
+        page_books = results[start : start + PAGE_SIZE]
+        page_count = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
+        
+        await self._send_book_cover_messages(
+            query.message,
+            page_books,
+            page_start=start,
+            final_message=f"Page {page + 1} of {page_count}",
+            final_markup=markup,
+        )
+    
+    async def _send_book_cover_messages(
+        self,
+        message,
+        page_books: List[Book],
+        page_start: int = 0,
+        final_message: Optional[str] = None,
+        final_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> None:
+        """Send one photo message per book, then navigation markup."""
+        sent_any = False
+        for offset, book in enumerate(page_books):
             if not book.cover_path:
                 continue
-            safe_title = html.escape(book.title)
-            safe_author = html.escape(book.authors)
-            caption = f"<b>{safe_title}</b> — {safe_author}"
+            
+            sent_any = True
+            caption = MessageFormatter.format_book_caption_with_index(book, page_start + offset + 1)
+            
             try:
-                medias.append(
-                    InputMediaPhoto(
-                        media=InputFile(book.cover_path),
-                        caption=caption,
-                        parse_mode=ParseMode.HTML,
-                    )
+                await message.reply_photo(
+                    photo=book.cover_path,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
                 )
             except Exception:
-                continue
+                logger.exception("Failed to send cover image for %s", book.title)
+        
+        # Send navigation message
+        if final_markup:
+            try:
+                await message.reply_text(final_message or "", reply_markup=final_markup)
+            except Exception:
+                try:
+                    await message.reply_text(final_message or "Current page", reply_markup=final_markup)
+                except Exception:
+                    logger.exception("Failed to send navigation markup")
 
-        if not medias:
-            await query.answer("No covers found for this page.", show_alert=True)
+
+# ============================================================================
+# Command Handlers
+# ============================================================================
+
+class CommandHandlers:
+    """Handles all bot commands."""
+    
+    def __init__(self, service: BookService, callback_handler: CallbackDataHandler):
+        self.service = service
+        self.callback_handler = callback_handler
+        self.response_builder = PagedResponseBuilder(service, callback_handler)
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /start command."""
+        await update.message.reply_text(
+            "Welcome to your library bot!\n\n"
+            "Use the buttons below to search by title or author, or choose a genre.",
+            reply_markup=UIBuilder.build_main_menu(),
+        )
+    
+    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /help command."""
+        await update.message.reply_text(
+            "Use the buttons below or type one of the options:\n"
+            "• Search by Name or Author\n"
+            "• Genres\n"
+            "• Help\n\n"
+            "If you choose Search, type any part of a title or author name.\n"
+            "If you choose Genres, tap a genre button to browse books in that tag.",
+            reply_markup=UIBuilder.build_main_menu(),
+        )
+    
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle text messages."""
+        text = update.message.text.strip()
+        
+        # Handle awaiting search
+        if context.user_data.get(MessageKey.AWAITING_SEARCH.value):
+            context.user_data[MessageKey.AWAITING_SEARCH.value] = False
+            await self._handle_search_query(update, context, text)
             return
-
-        await query.answer()
-        try:
-            await query.message.reply_media_group(media=medias)
-        except Exception:
-            await query.message.reply_text(
-                "Unable to send cover thumbnails for this page.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Back to results", callback_data=f"{payload['kind']}|{callback_id}|{page}")],
-                    [InlineKeyboardButton("Menu", callback_data="menu")],
-                ]),
+        
+        # Handle menu actions
+        lowered = text.lower()
+        if lowered == UserAction.SEARCH.value:
+            await self._ask_for_search(update, context)
+        elif lowered == UserAction.GENRES.value:
+            await self._send_genre_menu(update, context)
+        elif lowered == UserAction.HELP.value:
+            await self.help(update, context)
+        else:
+            await update.message.reply_text(
+                "Please use the menu buttons below or type Help for instructions.",
+                reply_markup=UIBuilder.build_main_menu(),
+            )
+    
+    async def _ask_for_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Ask user for search query."""
+        context.user_data[MessageKey.AWAITING_SEARCH.value] = True
+        await update.message.reply_text(
+            "Enter a book title or author name to search for.",
+            reply_markup=UIBuilder.build_main_menu(),
+        )
+    
+    async def _send_genre_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send genre selection menu and hide the keyboard."""
+        markup = UIBuilder.build_genre_buttons(self.service.genres, self.callback_handler)
+        # Send genre buttons and immediately remove keyboard
+        await update.message.reply_text(
+            "Choose a genre:",
+            reply_markup=markup,
+        )
+        # Remove keyboard by sending an empty message with ReplyKeyboardRemove
+        await update.message.reply_text(
+            " ",  # Single space to satisfy Telegram's non-empty message requirement
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    
+    async def _handle_search_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+        """Handle search query text."""
+        if not query:
+            await update.message.reply_text(
+                "Please send a non-empty search query.", reply_markup=UIBuilder.build_main_menu()
             )
             return
+        
+        results = self.service.find_by_query(query)
+        callback_id = self.callback_handler.encode(CallbackType.SEARCH.value, query.lower())
+        message, markup = self.response_builder.build_results_page(
+            results, 0, CallbackType.SEARCH.value, callback_id, f"search \"{MessageFormatter.escape_html(query)}\"",
+        )
+        
+        page_books = results[:PAGE_SIZE]
+        page_count = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
+        
+        factory = CallbackHandlerFactory(self.service, self.callback_handler)
+        await factory._send_book_cover_messages(
+            update.message,
+            page_books,
+            page_start=0,
+            final_message=f"Page 1 of {page_count}",
+            final_markup=markup,
+        )
 
+
+# ============================================================================
+# Callback Query Handler
+# ============================================================================
+
+async def handle_callback_query(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    service: BookService,
+    callback_handler: CallbackDataHandler,
+) -> None:
+    """Handle all callback queries."""
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    
+    data = query.data
+    
+    # Handle menu button
+    if data == CallbackType.MENU.value:
+        await query.answer()
         await query.message.reply_text(
-            "Here are the covers for this page.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Back to results", callback_data=f"{payload['kind']}|{callback_id}|{page}")],
-                [InlineKeyboardButton("Menu", callback_data="menu")],
-            ]),
+            reply_markup=UIBuilder.build_main_menu(),
         )
         return
-
-    if kind == "genre":
-        genre = payload["value"]
-        results = find_books_by_genre(genre)
-        label = f"genre \"{html.escape(genre)}\""
-        message, markup = render_books_page(
-            results, page, filter_kind="genre", callback_id=callback_id, label=label
-        )
-        # Send only the per-book photo messages and a navigation message
-        await query.answer()
-        start = page * PAGE_SIZE
-        page_books = results[start : start + PAGE_SIZE]
-        page_count = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
-        final_message = f"Page {page+1} of {page_count}"
-        await send_book_cover_messages(
-            query.message,
-            page_books,
-            page_start=start,
-            fallback_text="I could not send cover images for this genre page.",
-            final_markup=markup,
-            final_message=final_message,
-        )
+    
+    # Parse callback data
+    parsed = callback_handler.parse_callback_data(data)
+    if not parsed:
+        await query.answer("Unknown command", show_alert=True)
         return
-
-    if kind == "search":
-        query_text = payload["value"]
-        results = find_books_by_query(query_text)
-        label = f"search \"{html.escape(query_text)}\""
-        message, markup = render_books_page(
-            results, page, filter_kind="search", callback_id=callback_id, label=label
-        )
-        await query.answer()
-        start = page * PAGE_SIZE
-        page_books = results[start : start + PAGE_SIZE]
-        page_count = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
-        final_message = f"Page {page+1} of {page_count}"
-        await send_book_cover_messages(
-            query.message,
-            page_books,
-            page_start=start,
-            fallback_text="I could not send cover images for this search page.",
-            final_markup=markup,
-            final_message=final_message,
-        )
-        return
-
-    await query.answer("Unsupported action", show_alert=True)
+    
+    kind = parsed["kind"]
+    factory = CallbackHandlerFactory(service, callback_handler)
+    
+    try:
+        if kind == CallbackType.DETAIL.value:
+            await factory.handle_detail(query, parsed)
+        elif kind == CallbackType.SEARCH.value:
+            await factory.handle_search(query, parsed)
+        elif kind == CallbackType.GENRE.value:
+            await factory.handle_genre(query, parsed)
+        else:
+            await query.answer("Unsupported action", show_alert=True)
+    except Exception:
+        logger.exception("Error handling callback %s", kind)
+        await query.answer("An error occurred processing your request.", show_alert=True)
 
 
-def create_application() -> ApplicationBuilder:
+# ============================================================================
+# Application Setup
+# ============================================================================
+
+def create_application(service: BookService, callback_handler: CallbackDataHandler) -> Application:
+    """Create and configure the Telegram application."""
     load_dotenv(ENV_PATH)
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError(
             "The TELEGRAM_BOT_TOKEN environment variable is required to run the bot."
         )
-
+    
     logger.info("Telegram token loaded; building application.")
     print("Starting Librarybot application...", flush=True)
+    
     app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(handle_callback_query))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Create handlers
+    commands = CommandHandlers(service, callback_handler)
+    
+    # Add handlers
+    app.add_handler(CommandHandler("start", commands.start))
+    app.add_handler(CommandHandler("help", commands.help))
+    app.add_handler(CallbackQueryHandler(
+        lambda u, c: handle_callback_query(u, c, service, callback_handler)
+    ))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, commands.handle_text))
+    
     logger.info("Application built successfully.")
     return app
 
 
 def main() -> None:
-    global BOOKS, GENRES
+    """Main entry point."""
     load_dotenv(ENV_PATH)
-    BOOKS, GENRES = load_books(CSV_PATH)
-    logger.info("Loaded %d books and %d genres.", len(BOOKS), len(GENRES))
-    print(f"Loaded {len(BOOKS)} books and {len(GENRES)} genres.", flush=True)
-
-    app = create_application()
+    books = load_books(CSV_PATH)
+    logger.info("Loaded %d books.", len(books))
+    print(f"Loaded {len(books)} books.", flush=True)
+    
+    # Create services
+    service = BookService(books)
+    callback_handler = CallbackDataHandler()
+    
+    app_instance = create_application(service, callback_handler)
     logger.info("Startup complete. Bot is now polling Telegram updates.")
     print("Startup complete. Bot is now polling Telegram updates.", flush=True)
-    app.run_polling()
+    app_instance.run_polling()
 
 
 if __name__ == "__main__":
