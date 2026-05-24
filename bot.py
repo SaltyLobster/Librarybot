@@ -835,6 +835,7 @@ async def handle_callback_query(
     if data == CallbackType.MENU.value:
         await query.answer()
         await query.message.reply_text(
+            "Main menu:",
             reply_markup=UIBuilder.build_main_menu(),
         )
         return
