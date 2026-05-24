@@ -147,6 +147,27 @@ def normalize_name(value: str) -> str:
     return normalized
 
 
+def slug_name(value: str) -> str:
+    normalized = normalize_name(value)
+    parts = []
+    for char in normalized:
+        if char.isalnum():
+            parts.append(char)
+        else:
+            parts.append("-")
+    return "-".join("".join(parts).split()).strip("-")
+
+
+def first_cover_in_directory(directory: Path) -> Optional[str]:
+    if not directory.exists() or not directory.is_dir():
+        return None
+
+    for path in sorted(directory.iterdir()):
+        if path.is_file() and path.suffix.lower() in SUPPORTED_COVER_EXTENSIONS:
+            return str(path)
+    return None
+
+
 def get_cover_file_catalog() -> List[Path]:
     global COVER_FILE_CATALOG
     if COVER_FILE_CATALOG is not None:
@@ -187,6 +208,18 @@ def find_cover_for_book(book: Book) -> Optional[str]:
     covers_root = get_covers_root()
     if not covers_root.exists():
         return None
+
+    author_slug = slug_name(book.authors)
+    title_slug = slug_name(book.title)
+    if author_slug and title_slug:
+        folder_name = f"{author_slug}_{title_slug}"
+        for tag in book.tags:
+            cover_path = first_cover_in_directory(covers_root / tag / folder_name)
+            if cover_path:
+                return cover_path
+        cover_path = first_cover_in_directory(covers_root / folder_name)
+        if cover_path:
+            return cover_path
 
     title_key = normalize_name(book.title)
     author_key = normalize_name(book.authors)
