@@ -29,6 +29,7 @@ from bot import (
     parse_tags,
     normalize_name,
     normalize_cover_path,
+    resolve_telegram_token,
 )
 
 
@@ -419,11 +420,14 @@ class TestCallbackDataHandler:
     
     def test_parse_callback_data_with_item_index(self, callback_handler):
         """Test parsing callback data with item index."""
-        callback_id = callback_handler.encode("detail", "search|query")
+        search_callback_id = callback_handler.encode("search", "query")
+        callback_id = callback_handler.encode("detail", f"search|{search_callback_id}")
         data = callback_handler.build_callback_data("detail", callback_id, 1, 3)
         
         parsed = callback_handler.parse_callback_data(data)
         
+        assert parsed["kind"] == "detail"
+        assert parsed["value"] == f"search|{search_callback_id}"
         assert parsed["item_index"] == 3
     
     def test_parse_callback_data_invalid_format(self, callback_handler):
@@ -493,28 +497,27 @@ class TestUIBuilder:
         callback_id = callback_handler.encode("search", "query")
         buttons = UIBuilder.build_pagination_buttons("search", callback_id, 0, 3, callback_handler)
         
-        # First page should only have Next
-        assert len(buttons) == 1
-        assert buttons[0].text == "Next"
+        assert len(buttons) == 2
+        assert [button.text for button in buttons[0]] == ["Next"]
+        assert [button.text for button in buttons[1]] == [" 1 ", " 2 ", " 3 "]
     
     def test_build_pagination_buttons_last_page(self, callback_handler):
         """Test pagination buttons on last page."""
         callback_id = callback_handler.encode("search", "query")
         buttons = UIBuilder.build_pagination_buttons("search", callback_id, 2, 3, callback_handler)
         
-        # Last page should only have Previous
-        assert len(buttons) == 1
-        assert buttons[0].text == "Previous"
+        assert len(buttons) == 2
+        assert [button.text for button in buttons[0]] == ["Previous"]
+        assert [button.text for button in buttons[1]] == [" 1 ", " 2 ", " 3 "]
     
     def test_build_pagination_buttons_middle_page(self, callback_handler):
         """Test pagination buttons on middle page."""
         callback_id = callback_handler.encode("search", "query")
         buttons = UIBuilder.build_pagination_buttons("search", callback_id, 1, 3, callback_handler)
         
-        # Middle page should have both
         assert len(buttons) == 2
-        assert buttons[0].text == "Previous"
-        assert buttons[1].text == "Next"
+        assert [button.text for button in buttons[0]] == ["Previous", "Next"]
+        assert [button.text for button in buttons[1]] == [" 1 ", " 3 "]
     
     def test_build_pagination_buttons_single_page(self, callback_handler):
         """Test pagination buttons with single page."""
@@ -523,28 +526,6 @@ class TestUIBuilder:
         
         # Single page should have no buttons
         assert len(buttons) == 0
-    
-    def test_build_detail_buttons(self, sample_books, callback_handler):
-        """Test building detail buttons."""
-        callback_id = callback_handler.encode("search", "query")
-        buttons = UIBuilder.build_detail_buttons(
-            sample_books, "search", callback_id, 0, callback_handler
-        )
-        
-        # Should have buttons for books with covers
-        books_with_covers = [b for b in sample_books if b.cover_path]
-        assert len(buttons) > 0
-    
-    def test_build_detail_buttons_layout(self, sample_books, callback_handler):
-        """Test detail buttons layout (4 per row)."""
-        callback_id = callback_handler.encode("search", "query")
-        buttons = UIBuilder.build_detail_buttons(
-            sample_books, "search", callback_id, 0, callback_handler
-        )
-        
-        # Check that no row has more than 4 buttons
-        for row in buttons:
-            assert len(row) <= 4
     
     def test_build_back_to_results_buttons(self, callback_handler):
         """Test building back to results buttons."""
@@ -603,14 +584,24 @@ class TestPagedResponseBuilder:
         assert markup.inline_keyboard is not None
         assert len(markup.inline_keyboard) > 0
     
-    def test_build_results_page_detail_buttons(self, sample_books, paged_response_builder):
-        """Test that detail buttons are included for books with covers."""
+    def test_build_results_page_single_page_menu_only(self, sample_books, paged_response_builder):
+        """Test single-page results only include the menu button."""
         message, markup = paged_response_builder.build_results_page(
             sample_books, 0, CallbackType.SEARCH.value, "id", "test"
         )
         
-        # Should include detail buttons for books with covers
-        assert len(markup.inline_keyboard) > 1
+        assert len(markup.inline_keyboard) == 1
+        assert markup.inline_keyboard[0][0].text == "Menu"
+
+    def test_build_results_page_multiple_pages_pagination_then_menu(self, sample_books, paged_response_builder):
+        """Test multiple-page results include pagination rows followed by menu."""
+        many_books = sample_books * 5
+        message, markup = paged_response_builder.build_results_page(
+            many_books, 0, CallbackType.SEARCH.value, "id", "test"
+        )
+
+        assert [button.text for button in markup.inline_keyboard[0]] == ["Next"]
+        assert markup.inline_keyboard[-1][0].text == "Menu"
 
 
 # ============================================================================
@@ -648,6 +639,56 @@ class TestNormalizeCoverPath:
         mock_exists.return_value = False
         result = normalize_cover_path("relative/path/cover.jpg")
         assert result is None
+
+
+# ============================================================================
+# Tests for Telegram token selection
+# ============================================================================
+
+class TestTelegramTokenSelection:
+    """Test runtime token selection for prod and test bots."""
+
+    def test_resolve_telegram_token_prefers_test_token(self, monkeypatch):
+        """Test token resolution uses the test bot token when it is available."""
+        monkeypatch.delenv("LIBRARYBOT_ENV", raising=False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "prod-token")
+        monkeypatch.setenv("TEST_TELEGRAM_BOT_TOKEN", "test-token")
+
+        token, token_env = resolve_telegram_token()
+
+        assert token == "test-token"
+        assert token_env == "TEST_TELEGRAM_BOT_TOKEN"
+
+    def test_resolve_telegram_token_uses_prod_when_env_is_prod(self, monkeypatch):
+        """Test prod environment explicitly uses the production token."""
+        monkeypatch.setenv("LIBRARYBOT_ENV", "prod")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "prod-token")
+        monkeypatch.setenv("TEST_TELEGRAM_BOT_TOKEN", "test-token")
+
+        token, token_env = resolve_telegram_token()
+
+        assert token == "prod-token"
+        assert token_env == "TELEGRAM_BOT_TOKEN"
+
+    def test_resolve_telegram_token_falls_back_to_prod_token(self, monkeypatch):
+        """Test token resolution still works when only the production token exists."""
+        monkeypatch.delenv("LIBRARYBOT_ENV", raising=False)
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "prod-token")
+        monkeypatch.delenv("TEST_TELEGRAM_BOT_TOKEN", raising=False)
+
+        token, token_env = resolve_telegram_token()
+
+        assert token == "prod-token"
+        assert token_env == "TELEGRAM_BOT_TOKEN"
+
+    def test_resolve_telegram_token_requires_selected_token(self, monkeypatch):
+        """Test a clear error is raised when no usable token is configured."""
+        monkeypatch.delenv("LIBRARYBOT_ENV", raising=False)
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("TEST_TELEGRAM_BOT_TOKEN", raising=False)
+
+        with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
+            resolve_telegram_token()
 
 
 # ============================================================================

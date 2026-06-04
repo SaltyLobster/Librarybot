@@ -29,6 +29,9 @@ from telegram.ext import (
 CSV_PATH = Path(__file__).parent / "kindle_books.csv"
 ENV_PATH = Path(__file__).parent / ".env"
 PAGE_SIZE = 8
+TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
+TEST_TELEGRAM_TOKEN_ENV = "TEST_TELEGRAM_BOT_TOKEN"
+LIBRARYBOT_ENV_VAR = "LIBRARYBOT_ENV"
 SUPPORTED_COVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 COVER_FILE_CATALOG: Optional[List[Path]] = None
 COVER_CANDIDATE_INDEX: Optional[List[Tuple[Path, str, Set[str]]]] = None
@@ -299,6 +302,23 @@ def load_dotenv(dotenv_path: Path) -> None:
                 os.environ[key] = value
 
 
+def resolve_telegram_token() -> Tuple[str, str]:
+    """Resolve the bot token and return the token with the source env var name."""
+    app_env = os.environ.get(LIBRARYBOT_ENV_VAR, "").strip().lower()
+    token_env = TELEGRAM_TOKEN_ENV
+
+    if app_env != "prod" and os.environ.get(TEST_TELEGRAM_TOKEN_ENV):
+        token_env = TEST_TELEGRAM_TOKEN_ENV
+
+    token = os.environ.get(token_env)
+    if not token:
+        raise RuntimeError(
+            f"The {token_env} environment variable is required to run the bot."
+        )
+
+    return token, token_env
+
+
 # ============================================================================
 # Callback Data Handler - Manages callback serialization/deserialization
 # ============================================================================
@@ -529,7 +549,7 @@ class UIBuilder:
         rows.append([make_btn(p) for p in pages_to_show])
     
         return rows
-    
+
     @staticmethod
     def build_back_to_results_buttons(
         kind: str,
@@ -615,14 +635,23 @@ class CallbackHandlerFactory:
         """Handle detail view callback."""
         item_index = data["item_index"]
         page = data["page"]
-        callback_id = data["callback_id"]
-        kind = data["kind"]
         
         if item_index is None:
             await query.answer("Book selection is invalid.", show_alert=True)
             return
+
+        try:
+            source_kind, source_callback_id = data["value"].split("|", 1)
+        except ValueError:
+            await query.answer("Book selection is invalid.", show_alert=True)
+            return
+
+        source_payload = self.callback_handler.decode(source_callback_id)
+        if source_payload is None or source_payload.get("kind") != source_kind:
+            await query.answer("Book selection is no longer available.", show_alert=True)
+            return
         
-        results = self.service.get_results(kind, data["value"])
+        results = self.service.get_results(source_kind, source_payload.get("value", ""))
         item_offset = page * PAGE_SIZE + item_index
         if item_offset < 0 or item_offset >= len(results):
             await query.answer("This book is no longer available.", show_alert=True)
@@ -632,7 +661,7 @@ class CallbackHandlerFactory:
         caption = MessageFormatter.format_book_caption(book)
         await query.answer()
         
-        buttons = UIBuilder.build_back_to_results_buttons(kind, callback_id, page)
+        buttons = UIBuilder.build_back_to_results_buttons(source_kind, source_callback_id, page)
         
         if book.cover_path:
             try:
@@ -903,13 +932,9 @@ async def handle_callback_query(
 def create_application(service: BookService, callback_handler: CallbackDataHandler) -> Application:
     """Create and configure the Telegram application."""
     load_dotenv(ENV_PATH)
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "The TELEGRAM_BOT_TOKEN environment variable is required to run the bot."
-        )
+    token, token_env = resolve_telegram_token()
     
-    logger.info("Telegram token loaded; building application.")
+    logger.info("Telegram token loaded from %s; building application.", token_env)
     print("Starting Librarybot application...", flush=True)
     
     app = ApplicationBuilder().token(token).build()
