@@ -53,17 +53,24 @@ def main():
     handler = LocalHandler
     
     # Set up SSL context
-    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    context.load_cert_chain(
-        certfile=str(BASE_DIR / "server.crt"),
-        keyfile=str(BASE_DIR / "server.key")
-    )
+    # We disable SSL local wrapping if we are using a tunnel like ngrok
+    # because ngrok handles the HTTPS part for us.
+    use_ssl = False 
     
     with socketserver.TCPServer(("", PORT), handler) as httpd:
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-        print(f"🚀 Librarybot Local Server (HTTPS)")
-        print(f"📍 https://localhost:{PORT}")
-        print(f"📍 https://192.168.1.21:{PORT}")
+        if use_ssl:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(
+                certfile=str(BASE_DIR / "server.crt"),
+                keyfile=str(BASE_DIR / "server.key")
+            )
+            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+            print(f"🚀 Librarybot Local Server (HTTPS)")
+        else:
+            print(f"🚀 Librarybot Local Server (HTTP - Ready for ngrok)")
+
+        print(f"📍 http://localhost:{PORT}")
+        print(f"📍 http://192.168.1.21:{PORT}")
         print(f"📁 Serving: {BASE_DIR}/webapp/")
         print(f"📁 Covers:  {BASE_DIR}/Bookcovers/ (as /covers/)")
         print(f"\nPress Ctrl+C to stop\n")
