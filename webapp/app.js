@@ -77,6 +77,9 @@ function render() {
   const pages = pageCount();
   const books = currentPageBooks();
 
+  // Save scroll position to prevent jumping
+  const scrollPos = window.scrollY;
+
   els.count.textContent = `${state.books.length} books`;
   els.summary.textContent = total === 1 ? "1 result" : `${total} results`;
   els.pageSummary.textContent = total ? `Page ${state.page + 1} of ${pages}` : "";
@@ -84,6 +87,9 @@ function render() {
   renderList(books);
   renderPager(pages);
   renderSelected(books);
+
+  // Restore scroll position
+  window.scrollTo(0, scrollPos);
 }
 
 function renderList(books) {
