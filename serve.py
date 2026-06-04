@@ -8,11 +8,12 @@ Serves:
 Usage:
   python3 serve.py
   
-Then open: http://localhost:8080
+Then open: https://localhost:8080
 """
 
 import http.server
 import socketserver
+import ssl
 import os
 from pathlib import Path
 from urllib.parse import urlparse
@@ -50,9 +51,19 @@ class LocalHandler(http.server.SimpleHTTPRequestHandler):
 
 def main():
     handler = LocalHandler
+    
+    # Set up SSL context
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(
+        certfile=str(BASE_DIR / "server.crt"),
+        keyfile=str(BASE_DIR / "server.key")
+    )
+    
     with socketserver.TCPServer(("", PORT), handler) as httpd:
-        print(f"🚀 Librarybot Local Server")
-        print(f"📍 http://localhost:{PORT}")
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        print(f"🚀 Librarybot Local Server (HTTPS)")
+        print(f"📍 https://localhost:{PORT}")
+        print(f"📍 https://192.168.1.21:{PORT}")
         print(f"📁 Serving: {BASE_DIR}/webapp/")
         print(f"📁 Covers:  {BASE_DIR}/Bookcovers/ (as /covers/)")
         print(f"\nPress Ctrl+C to stop\n")
