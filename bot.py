@@ -10,7 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, WebAppInfo
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -32,6 +32,7 @@ PAGE_SIZE = 8
 TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 TEST_TELEGRAM_TOKEN_ENV = "TEST_TELEGRAM_BOT_TOKEN"
 LIBRARYBOT_ENV_VAR = "LIBRARYBOT_ENV"
+WEB_APP_URL_ENV = "TELEGRAM_WEB_APP_URL"
 SUPPORTED_COVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 COVER_FILE_CATALOG: Optional[List[Path]] = None
 COVER_CANDIDATE_INDEX: Optional[List[Tuple[Path, str, Set[str]]]] = None
@@ -319,6 +320,12 @@ def resolve_telegram_token() -> Tuple[str, str]:
     return token, token_env
 
 
+def resolve_web_app_url() -> Optional[str]:
+    """Return the configured Telegram Web App URL, if any."""
+    value = os.environ.get(WEB_APP_URL_ENV, "").strip()
+    return value or None
+
+
 # ============================================================================
 # Callback Data Handler - Manages callback serialization/deserialization
 # ============================================================================
@@ -479,12 +486,14 @@ class UIBuilder:
     """Builds UI elements (buttons, keyboards) for messages."""
     
     @staticmethod
-    def build_main_menu() -> ReplyKeyboardMarkup:
+    def build_main_menu(web_app_url: Optional[str] = None) -> ReplyKeyboardMarkup:
         """Build the main menu keyboard."""
         buttons = [
             [KeyboardButton(UserAction.SEARCH.value), KeyboardButton(UserAction.GENRES.value)],
             [KeyboardButton(UserAction.HELP.value)],
         ]
+        if web_app_url:
+            buttons.insert(0, [KeyboardButton("Open Library", web_app=WebAppInfo(web_app_url))])
         return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
     
     @staticmethod
@@ -778,17 +787,18 @@ class CallbackHandlerFactory:
 class CommandHandlers:
     """Handles all bot commands."""
     
-    def __init__(self, service: BookService, callback_handler: CallbackDataHandler):
+    def __init__(self, service: BookService, callback_handler: CallbackDataHandler, web_app_url: Optional[str] = None):
         self.service = service
         self.callback_handler = callback_handler
+        self.web_app_url = web_app_url
         self.response_builder = PagedResponseBuilder(service, callback_handler)
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
         await update.message.reply_text(
             "Welcome to your library bot!\n\n"
-            "Use the buttons below to search by title or author, or choose a genre.",
-            reply_markup=UIBuilder.build_main_menu(),
+            "Open the library window, search by title or author, or choose a genre.",
+            reply_markup=UIBuilder.build_main_menu(self.web_app_url),
         )
     
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -800,7 +810,7 @@ class CommandHandlers:
             "• Help\n\n"
             "If you choose Search, type any part of a title or author name.\n"
             "If you choose Genres, tap a genre button to browse books in that tag.",
-            reply_markup=UIBuilder.build_main_menu(),
+            reply_markup=UIBuilder.build_main_menu(self.web_app_url),
         )
     
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -824,7 +834,7 @@ class CommandHandlers:
         else:
             await update.message.reply_text(
                 "Please use the menu buttons below or type Help for instructions.",
-                reply_markup=UIBuilder.build_main_menu(),
+                reply_markup=UIBuilder.build_main_menu(self.web_app_url),
             )
     
     async def _ask_for_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -832,7 +842,7 @@ class CommandHandlers:
         context.user_data[MessageKey.AWAITING_SEARCH.value] = True
         await update.message.reply_text(
             "Enter a book title or author name to search for.",
-            reply_markup=UIBuilder.build_main_menu(),
+            reply_markup=UIBuilder.build_main_menu(self.web_app_url),
         )
     
     async def _send_genre_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -853,7 +863,7 @@ class CommandHandlers:
         """Handle search query text."""
         if not query:
             await update.message.reply_text(
-                "Please send a non-empty search query.", reply_markup=UIBuilder.build_main_menu()
+                "Please send a non-empty search query.", reply_markup=UIBuilder.build_main_menu(self.web_app_url)
             )
             return
         
@@ -885,6 +895,7 @@ async def handle_callback_query(
     context: ContextTypes.DEFAULT_TYPE,
     service: BookService,
     callback_handler: CallbackDataHandler,
+    web_app_url: Optional[str] = None,
 ) -> None:
     """Handle all callback queries."""
     query = update.callback_query
@@ -898,7 +909,7 @@ async def handle_callback_query(
         await query.answer()
         await query.message.reply_text(
             "Main menu:",
-            reply_markup=UIBuilder.build_main_menu(),
+            reply_markup=UIBuilder.build_main_menu(web_app_url),
         )
         return
     
@@ -933,20 +944,23 @@ def create_application(service: BookService, callback_handler: CallbackDataHandl
     """Create and configure the Telegram application."""
     load_dotenv(ENV_PATH)
     token, token_env = resolve_telegram_token()
+    web_app_url = resolve_web_app_url()
     
     logger.info("Telegram token loaded from %s; building application.", token_env)
+    if web_app_url:
+        logger.info("Telegram Web App URL configured.")
     print("Starting Librarybot application...", flush=True)
     
     app = ApplicationBuilder().token(token).build()
     
     # Create handlers
-    commands = CommandHandlers(service, callback_handler)
+    commands = CommandHandlers(service, callback_handler, web_app_url)
     
     # Add handlers
     app.add_handler(CommandHandler("start", commands.start))
     app.add_handler(CommandHandler("help", commands.help))
     app.add_handler(CallbackQueryHandler(
-        lambda u, c: handle_callback_query(u, c, service, callback_handler)
+        lambda u, c: handle_callback_query(u, c, service, callback_handler, web_app_url)
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, commands.handle_text))
     

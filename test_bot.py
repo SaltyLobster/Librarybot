@@ -30,6 +30,7 @@ from bot import (
     normalize_name,
     normalize_cover_path,
     resolve_telegram_token,
+    resolve_web_app_url,
 )
 
 
@@ -466,6 +467,14 @@ class TestUIBuilder:
         assert menu is not None
         assert menu.keyboard is not None
         assert len(menu.keyboard) > 0
+
+    def test_build_main_menu_with_web_app_button(self):
+        """Test building main menu with a Telegram Web App launcher."""
+        menu = UIBuilder.build_main_menu("https://example.com/library")
+
+        assert menu.keyboard[0][0].text == "Open Library"
+        assert menu.keyboard[0][0].web_app.url == "https://example.com/library"
+        assert menu.keyboard[1][0].text == UserAction.SEARCH.value
     
     def test_build_genre_buttons(self, book_service, callback_handler):
         """Test building genre buttons."""
@@ -689,6 +698,18 @@ class TestTelegramTokenSelection:
 
         with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
             resolve_telegram_token()
+
+    def test_resolve_web_app_url_returns_configured_url(self, monkeypatch):
+        """Test Web App URL resolution returns a configured Telegram Mini App URL."""
+        monkeypatch.setenv("TELEGRAM_WEB_APP_URL", "https://example.com/library")
+
+        assert resolve_web_app_url() == "https://example.com/library"
+
+    def test_resolve_web_app_url_returns_none_when_missing(self, monkeypatch):
+        """Test Web App URL resolution is optional."""
+        monkeypatch.delenv("TELEGRAM_WEB_APP_URL", raising=False)
+
+        assert resolve_web_app_url() is None
 
 
 # ============================================================================

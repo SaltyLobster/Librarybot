@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Librarybot</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Librarybot</p>
+          <h1>Library</h1>
+        </div>
+        <div class="count" id="book-count">0 books</div>
+      </header>
+
+      <section class="controls" aria-label="Library controls">
+        <label class="search-field">
+          <span>Search</span>
+          <input id="search-input" type="search" placeholder="Title or author" autocomplete="off">
+        </label>
+        <label class="genre-field">
+          <span>Genre</span>
+          <select id="genre-select">
+            <option value="">All genres</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="content-grid">
+        <section class="results-panel" aria-label="Books">
+          <div class="list-meta">
+            <span id="result-summary">Loading catalog</span>
+            <span id="page-summary"></span>
+          </div>
+          <div class="book-list" id="book-list"></div>
+          <nav class="pager" aria-label="Pagination">
+            <button type="button" id="prev-button">Previous</button>
+            <div id="page-buttons" class="page-buttons"></div>
+            <button type="button" id="next-button">Next</button>
+          </nav>
+        </section>
+
+        <aside class="detail-panel" id="detail-panel" aria-label="Selected book">
+          <p class="eyebrow">Selected</p>
+          <h2 id="detail-title">Choose a book</h2>
+          <p id="detail-author" class="detail-author"></p>
+          <div id="detail-tags" class="tag-row"></div>
+          <p id="detail-description" class="description"></p>
+        </aside>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
