@@ -1,5 +1,12 @@
 const PAGE_SIZE = 12;
 
+// Debug: Log to page
+window.debugLog = [];
+window.addEventListener('error', (e) => {
+  window.debugLog.push(`ERROR: ${e.message}`);
+  console.error(e);
+});
+
 const state = {
   books: [],
   filtered: [],
@@ -29,10 +36,30 @@ const els = {
 
 function initTelegram() {
   const tg = window.Telegram?.WebApp;
-  if (!tg) return;
+  if (!tg) {
+    console.log('Telegram WebApp not available - running in browser');
+    return;
+  }
 
-  tg.ready();
-  tg.expand();
+  try {
+    tg.ready();
+    tg.expand();
+    
+    // Force visible colors in case Telegram theme is not loaded
+    const root = document.documentElement;
+    const style = getComputedStyle(root);
+    
+    // Ensure background is not transparent
+    if (!style.getPropertyValue('--bg') || style.getPropertyValue('--bg').includes('undefined')) {
+      root.style.setProperty('--bg', '#ffffff');
+      root.style.setProperty('--text', '#000000');
+      root.style.setProperty('--surface', '#f5f5f5');
+    }
+    
+    console.log('Telegram WebApp initialized');
+  } catch (error) {
+    console.error('Telegram init error:', error);
+  }
 }
 
 function normalize(value) {

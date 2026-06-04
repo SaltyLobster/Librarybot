@@ -20,6 +20,8 @@ body {
   min-height: 100vh;
   background: var(--bg);
   color: var(--text);
+  background-color: #f5f7f9;
+  color: #18202a;
 }
 
 button,
@@ -46,6 +48,9 @@ button:disabled {
   width: min(1180px, 100%);
   margin: 0 auto;
   padding: 16px;
+  background: var(--bg);
+  background-color: #f5f7f9;
+  min-height: 100vh;
 }
 
 .topbar {
