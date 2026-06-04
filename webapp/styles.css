@@ -236,6 +236,19 @@ button:focus-visible {
   color: var(--accent-text);
 }
 
+.detail-cover {
+  width: 100%;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  background: var(--bg);
+  aspect-ratio: 2/3;
+  object-fit: cover;
+}
+
+.detail-cover[src=""] {
+  display: none;
+}
+
 .detail-author,
 .description {
   color: var(--muted);

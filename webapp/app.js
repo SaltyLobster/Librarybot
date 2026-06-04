@@ -20,6 +20,7 @@ const els = {
   prev: document.querySelector("#prev-button"),
   next: document.querySelector("#next-button"),
   pages: document.querySelector("#page-buttons"),
+  detailCover: document.querySelector("#detail-cover"),
   detailTitle: document.querySelector("#detail-title"),
   detailAuthor: document.querySelector("#detail-author"),
   detailTags: document.querySelector("#detail-tags"),
@@ -165,6 +166,7 @@ function renderSelected(visibleBooks) {
   const selected = state.filtered.find((book) => book.id === state.selectedId) || visibleBooks[0];
 
   if (!selected) {
+    els.detailCover.src = "";
     els.detailTitle.textContent = "Choose a book";
     els.detailAuthor.textContent = "";
     els.detailTags.replaceChildren();
@@ -173,6 +175,8 @@ function renderSelected(visibleBooks) {
   }
 
   state.selectedId = selected.id;
+  els.detailCover.src = selected.cover_path || "";
+  els.detailCover.alt = selected.title;
   els.detailTitle.textContent = selected.title;
   els.detailAuthor.textContent = selected.authors || "Unknown author";
   els.detailDescription.textContent = selected.description || "No description available.";
